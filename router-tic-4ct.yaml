@@ -1,0 +1,916 @@
+esphome:
+  name: "router-tic-4ct"
+  friendly_name: router-tic-4ct
+  on_boot:
+    priority: 800
+    then: 
+      - binary_sensor.template.publish:
+          id: temperature_triac_ok
+          state: OFF
+      - output.turn_off: led_green
+      - output.turn_off: led_red
+# on initialise a zero old_hp et old_hc a chaque demarage car il n'y a pas de sauvegarde de la valeur
+      - sensor.template.publish:
+          id: old_hc
+          state : 0
+      - sensor.template.publish:
+          id: old_hp
+          state : 0
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  baud_rate: 0  
+  level: INFO
+
+# Enable Home Assistant API
+api:
+
+# Enable over the air update
+ota:
+  - platform: esphome
+
+substitutions:
+# dimmer
+  gate_pin: GPIO33
+  zerocross_pin: GPIO34
+# led  
+  green_led_pin: GPIO32
+  red_led_pin: GPIO25
+# dallas 1 wire
+  dallas_pin: GPIO27
+  dallas_address: "0xa0e85ce908646128"
+# bus i²c
+  sda_pin: GPIO21
+  scl_pin: GPIO22
+# uart
+  rxd_modbus_pin: GPIO16
+  txd_modbus_pin: GPIO17 
+  rxd_teleinfo_pin: GPIO3
+# localisation  
+  time_timezone: "Europe/Paris"
+  ma_latitude: "43.659°"
+  ma_longiture: "1.310°"
+  update_freq: 1s
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 5min
+  manual_ip:
+    static_ip: 192.168.1.57
+    gateway: 192.168.1.254
+    subnet: 255.255.255.0
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Test-Esp32-Tic Fallback Hotspot"
+    password: !secret wifi_password
+
+captive_portal:
+
+external_components:
+  - source: github://dentra/esphome-components
+backup:
+
+web_server:
+  port: 80    
+
+time:
+- platform: homeassistant
+  id: ha_time
+# a minuit on initialise old_hc et old_hp avec la valeur du compteur de consommation total thp et thc
+  on_time: 
+    - seconds: 0
+      minutes: 59
+      hours: 23 
+      then : 
+        - script.execute : reset_hphc
+
+# necessaire pour determiner le mode jur et le mode nuit        
+sun:
+  latitude: ${ma_latitude}
+  longitude: ${ma_longiture}
+
+# activation de l'interface i²c
+i2c:
+  sda: ${sda_pin}
+  scl: ${scl_pin}
+  scan: True
+  id: i2c_bus_1
+  frequency: 200khz
+
+#actiovation des interfaces UART (serie) necessaire pour le capteur jsymk et la teleinformation
+uart:
+- id: uart_mod_bus
+  tx_pin: ${txd_modbus_pin}
+  rx_pin: ${rxd_modbus_pin}
+  baud_rate: 38400
+  stop_bits: 1
+
+- id: uart_teleinformation
+  rx_pin: GPIO3
+  baud_rate: 1200
+  parity: EVEN
+  data_bits: 7
+  rx_buffer_size: 2048
+
+teleinfo:
+  id: myteleinfo
+  update_interval: 5s
+  historical_mode: true
+  uart_id: uart_teleinformation
+
+#le module jsymk communique via le bus modbus
+modbus:
+  uart_id: uart_mod_bus
+  id: modbus1
+
+modbus_controller:
+  - id: jsymk
+    address: 0x1
+    modbus_id: modbus1
+    update_interval: 0.75s
+    command_throttle: 50ms
+
+# activation du bus one wire necessaire pour la sonde de courant
+one_wire:
+  - platform: gpio
+    pin: ${dallas_pin} 
+
+
+# on active les 2 modules ADC necessaire pour les 4 sondes de courant
+ads1115:
+  - address: 0x48
+    id : ads1
+    continuous_mode: true
+  - address: 0x49
+    id : ads2
+    continuous_mode: true
+
+globals:
+# increment est la variable qui est utilisée pour le calcul de la variation de la valeur d'ouverture du triac
+   - id: increment
+     type: float
+     restore_value: no
+     initial_value: '0'
+
+# Sortie triac est la valeur donnee au dimmer	 
+   - id: sortie_triac
+     type: float
+     initial_value: '0'
+
+# Compteur de pages pour l'afficheur LCD
+   - id: page
+     type: int
+     initial_value: '1'
+
+number:
+# Seuil Max sortie triac
+  - platform: template
+    name: "Puissance Max"
+    id: pmax
+    optimistic: true
+    restore_value: true
+    mode: box
+    min_value: 10
+    max_value: 80
+    unit_of_measurement: "%"
+    step: 5
+
+# Temperature Maxi du triac avant coupure eviter de depasser 70° c'est deja une valeur assez elevée.
+  - platform: template
+    name: "Temperature Max"
+    id: tmax
+    optimistic: true
+    restore_value: true
+    initial_value: 40
+    mode: box
+    min_value: 0
+    max_value: 70
+    unit_of_measurement: "°C"
+    step: 1
+
+# Coefficient de reactivité du routeur
+  - platform: template
+    name: "Coeff Reactivite"
+    id: coeff_r
+    optimistic: true
+    restore_value: true
+    mode: box
+    initial_value: 1
+    min_value: 0
+    max_value: 10
+    unit_of_measurement: ""
+    step: 0.1
+
+binary_sensor:
+# indicateur surchauffe
+  - platform: template
+    name: "Triac Temp Ok"
+    id: temperature_triac_ok
+
+# indicateur mode jour ou nuit
+  - platform: template
+    name: "Mode Nuit"
+    id: mode_nuit
+
+# identification du mode heure pleine heure creuse utilisé pour forcer la chauffe la nuit et en heure creuse	
+  - platform: template
+    name: "Sensor Heure Pleine"
+    id: mode_hp
+
+# activation du routeur necessite de creer dans home assistant un helper boolean afin d'activer ou non le routage 
+  - platform: homeassistant
+    name: "Validation Routeur"
+    entity_id: "input_boolean.inter_validation_routeur"
+    publish_initial_state: true
+    id: val_routeur 
+
+sensor:
+#déclaration de la sonde de temperature
+  - platform: dallas_temp
+    address: ${dallas_address}
+    name: "temperature triac"
+    id: temperature_triac
+    update_interval: 2s
+
+# variable interne pour la regulation du routage
+  - platform: template
+    name: "Increment"
+    id: affichage_increment
+    unit_of_measurement: ""
+    accuracy_decimals: 2
+    state_class: "measurement"
+
+# variable utilisée pour le Dimmer
+  - platform: template
+    name: "Sortie Triac"
+    id: affichage_sortie_triac
+    unit_of_measurement: "%"
+    state_class: "measurement"  
+    accuracy_decimals: 2
+
+# Simulation d'un utility meter pour la consommation heure creuse et heure pleine avec un reset a minuit; cette fonction n'existe pas dans esphome
+  - platform: template
+    name: "HEURE CREUSE JOUR"
+    id: hcj
+    unit_of_measurement: "kwh"
+    lambda: return (float(id(thc).state) - float(id(old_hc).state))/1000;
+    device_class: energy
+    update_interval: 60s
+
+
+  - platform: template
+    name: "HEURE PLEINE JOUR"
+    id: hpj
+    unit_of_measurement: "kwh"
+    lambda: return (float(id(thp).state) - float(id(old_hp).state))/1000;
+    device_class: energy
+    update_interval: 60s
+
+  - platform: template
+    name : "old_hc"
+    id: old_hc
+
+  - platform: template
+    name : "old_hp"
+    id: old_hp
+
+
+#definition des sensors pour les 4 sondes de courant additionnelles
+
+# channel A
+
+  - platform: ads1115
+    ads1115_id: ads2
+    multiplexer: 'A0_A1'
+    gain: 1.024
+    name: "Channel A"
+    force_update: true
+    id: Channel_A
+    internal: true
+
+  - platform: ct_clamp
+    sensor: Channel_A
+    name: "Measured Current Channel A"
+    update_interval: ${update_freq}
+    accuracy_decimals: 2
+    filters:
+      - calibrate_linear:
+          - 0 -> 0
+          - 1 -> 30   
+    id: current_channel_A
+
+  - platform: template
+    name: power channel a
+    id: power_channel_a
+    update_interval: ${update_freq}
+    unit_of_measurement: W
+    lambda: return id(current_channel_A).state * id(tension).state ;
+
+  - platform: total_daily_energy
+    name: energy channel a
+    power_id: power_channel_a
+    id: energy_channel_a
+    unit_of_measurement: kWh
+    device_class: energy    
+    filters:
+      - multiply: .001
+
+# channel B
+
+  - platform: ads1115
+    ads1115_id: ads2
+    multiplexer: 'A2_A3'
+    gain: 1.024
+    name: "Channel A"
+    force_update: true
+    id: Channel_B
+    internal: true
+
+  - platform: ct_clamp
+    sensor: Channel_B
+    name: "Measured Current Channel B"
+    update_interval: ${update_freq}
+    accuracy_decimals: 2
+    filters:
+      - calibrate_linear:
+          - 0 -> 0
+          - 1 -> 30   
+    id: current_channel_B
+
+  - platform: template
+    name: power channel b
+    id: power_channel_b
+    update_interval: ${update_freq}
+    unit_of_measurement: W
+    lambda: return id(current_channel_B).state * id(tension).state;
+
+  - platform: total_daily_energy
+    name: energy channel b
+    power_id: power_channel_b
+    id: energy_channel_b
+    unit_of_measurement: kWh
+    device_class: energy    
+    filters:
+      - multiply: .001
+
+# channel C
+
+  - platform: ads1115
+    ads1115_id: ads1
+    multiplexer: 'A0_A1'
+    gain: 1.024
+    name: "Channel C"
+    force_update: true
+    id: Channel_C
+    internal: true
+
+  - platform: ct_clamp
+    sensor: Channel_C
+    name: "Measured Current Channel C"
+    update_interval: ${update_freq}
+    accuracy_decimals: 2
+    filters:
+      - calibrate_linear:
+          - 0 -> 0
+          - 1 -> 30   
+    id: current_channel_C
+
+  - platform: template
+    name: power channel c
+    id: power_channel_c
+    update_interval: ${update_freq}
+    unit_of_measurement: W
+    lambda: return id(current_channel_C).state *  id(tension).state;
+
+  - platform: total_daily_energy
+    name: energy channel c
+    power_id: power_channel_c
+    id: energy_channel_c  
+    unit_of_measurement: kWh
+    device_class: energy    
+    filters:
+      - multiply: .001
+
+# channel D
+  - platform: ads1115
+    ads1115_id: ads1
+    multiplexer: 'A2_A3'
+    gain: 1.024
+    name: "Channel D"
+    force_update: true
+    id: Channel_D
+    internal: true
+
+  - platform: ct_clamp
+    sensor: Channel_D
+    name: "Measured Current Channel D"
+    update_interval: ${update_freq}
+    accuracy_decimals: 2
+    filters:
+      - calibrate_linear:
+          - 0 -> 0
+          - 1 -> 30   
+    id: current_channel_D
+
+  - platform: template
+    name: power channel d
+    id: power_channel_d
+    update_interval: ${update_freq}
+    unit_of_measurement: W
+    lambda: return id(current_channel_D).state * id(tension).state;
+
+  - platform: total_daily_energy
+    name: energy channel d
+    power_id: power_channel_d
+    id: energy_channel_d
+    unit_of_measurement: kWh
+    device_class: energy    
+    filters:
+      - multiply: .001
+
+
+#definition des sensors pour le module d'aquisition utilisé pour le routage
+  - platform: modbus_controller
+    modbus_controller_id: jsymk
+    id: puissance_ecs
+    name: "Puissance ECS"
+    address: 0x004A
+    unit_of_measurement: "W"
+    register_type: holding
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.0001
+    register_count: 1
+    response_size: 4 
+
+  - platform: modbus_controller
+    modbus_controller_id: jsymk
+    id: puissance_reseau_absolue
+    name: "Puissance Reseau Absolue"
+    address: 0x0052
+    unit_of_measurement: "W"
+    register_type: holding
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.0001
+    register_count: 1
+    response_size: 4 
+    on_value:
+      then:
+        - lambda: |-
+            if ( id(sens_pince).state == 1 ) {
+              id(puissance_reseau).publish_state( id(puissance_reseau_absolue).state *-1);
+            } else {
+              id(puissance_reseau).publish_state( id(puissance_reseau_absolue).state );
+            }
+
+  - platform: total_daily_energy
+    name: "Energie Injectée ECS"
+    id: energy_ecs
+    power_id: puissance_ecs
+    unit_of_measurement: kWh
+    device_class: energy    
+    filters:
+      - multiply: .001
+
+  - platform: template
+    name: "Puissance Reseau"
+    id: puissance_reseau
+    unit_of_measurement: "W"
+    state_class: "measurement" 
+
+  - platform: modbus_controller
+    modbus_controller_id: jsymk
+    id: tension
+    name: "tension"
+    address: 0x0048
+    unit_of_measurement: "v"
+    register_type: holding
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.0001
+    register_count: 1
+    response_size: 4
+
+  - platform: modbus_controller
+    modbus_controller_id: jsymk
+    id: sens_pince
+    name: "Sens_Pince"
+    address: 0x004E
+    register_type: holding
+    value_type: U_DWORD
+    bitmask: 0X00010000
+    filters:
+      - multiply: 1
+    register_count: 1
+    response_size: 4
+
+# quelques sensors additionels 
+  - platform: wifi_signal 
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: uptime
+    name: "uptime"
+    id: esp_uptime
+    filters:
+      - lambda: return x / 3600.0;
+    unit_of_measurement: "hours"
+    accuracy_decimals: 2    
+
+# Declarations pour la teleinformation
+  #Linky BASE value
+  - platform: teleinfo
+    tag_name: "HCHC"
+    id: thc 
+    name: "Total Heure Creuse"
+    filters:
+      - filter_out: 0
+    unit_of_measurement: "Wh"
+    icon: mdi:counter
+    teleinfo_id: myteleinfo
+    device_class: energy
+    on_value: 
+
+      then:
+        - if:
+            condition:
+              lambda: 'return id(old_hc).state == 0;'
+            then:
+              - sensor.template.publish:
+                  id: old_hc
+                  state: !lambda |-
+                    return id(thc).state;
+
+  - platform: teleinfo
+    tag_name: "HCHP"
+    id: thp
+    name: "Total Heure Pleine"
+    filters:
+      - filter_out: 0
+    unit_of_measurement: "Wh"
+    icon: mdi:counter
+    teleinfo_id: myteleinfo
+    device_class: energy
+    on_value: 
+      then:
+        - if:
+            condition:
+              lambda: 'return id(old_hp).state == 0;'
+            then:
+              - sensor.template.publish:
+                  id: old_hp
+                  state: !lambda |-
+                    return id(thp).state;
+
+  #Linky Consumption
+  - platform: teleinfo
+    tag_name: "PAPP"
+    name: "Linky Consommation"
+    unit_of_measurement: "VA"
+    icon: mdi:flash
+    teleinfo_id: myteleinfo
+    id: papp
+    
+   #Linky Intensity
+  - platform: teleinfo
+    tag_name: "IINST"
+    name: "Linky Intensité"
+    unit_of_measurement: "A"
+    icon: mdi:flash
+    teleinfo_id: myteleinfo
+
+#sensor PTEC puisssance tarrifaire en cours     
+text_sensor:
+  - platform: teleinfo
+    tag_name: "PTEC"
+    name: "ptec"
+    id: ptec
+    teleinfo_id: myteleinfo
+
+button:
+  - platform: restart
+    name: "Restart"
+
+output:
+  - id: led_red
+    platform: gpio
+    pin: ${red_led_pin}
+#    inverted: true
+    
+  - id: led_green
+    platform: gpio
+    pin: ${green_led_pin}
+#    inverted: true
+
+  - platform: ac_dimmer
+    id: dimmer_ecs
+    gate_pin: ${gate_pin}
+    method: leading
+    zero_cross_pin:
+      number: ${zerocross_pin}
+      mode:
+        input: true
+      inverted: yes
+    min_power: 0.1
+    
+light:
+  - platform: monochromatic
+    name: "Dimmer"
+    output: dimmer_ecs
+    id: gradateur
+    default_transition_length: 50ms
+
+#  - platform: status_led
+#    id: wifi_status_led
+#    pin:
+#      number: GPIO13
+
+display:
+  - platform: lcd_pcf8574
+    id: mydisplay
+    dimensions: 20x4
+    address: 0x27
+    lambda: |-
+          switch (id(page)){
+            case 1 :
+            it.strftime(2, 0, "%H:%M %d-%m-%Y", id(ha_time).now());
+            it.printf(0,1,"tarif:%s", id(ptec).state.c_str() );
+            it.printf(16,1,"%s", id(mode_nuit).state ? "Nuit" : "Jour");
+            it.printf(0,2,"uptime %0.f H",id(esp_uptime).state);
+            it.printf(0,3,"Wifi:%0.1f dB", id(wifi_signal_db).state);
+              break;
+            case 2 :
+            it.strftime(2, 0, "%H:%M %d-%m-%Y", id(ha_time).now());
+            it.printf(0,1,"P Reseau=%0.0f W",id(puissance_reseau).state);
+            it.printf(0,2,"P ECS=%0.0f W ",id(puissance_ecs).state);
+            it.printf(0,3,"Energie ECS=%0.3f kWh",id(energy_ecs).state); 
+              break;
+            case 3 :
+            it.strftime(2, 0, "%H:%M %d-%m-%Y", id(ha_time).now());
+            it.printf(0,1,"Triac T=%0.1f C", id(temperature_triac).state);
+            it.printf(10,2,"Ouv T:%0.0f", id(affichage_sortie_triac).state);
+            it.printf(0,2,"Inc %0.1f", id(affichage_increment).state);
+            it.printf(0,3,"Mode=%s", id(modeauto).state ? "Auto" : "Manu"); 
+              break;
+            case 4 :
+            it.strftime(2, 0, "%H:%M %d-%m-%Y", id(ha_time).now());
+            it.printf(0,1,"hpj=%0.3f kWh", id(hpj).state);
+            it.printf(0,2,"hcj=%0.3f kWh", id(hcj).state);
+            it.printf(0,3,"papp:%0.0f VA", id(papp).state);
+            it.printf(10,3,"tarif:%s", id(ptec).state.c_str() );
+              break;
+            case 5 :
+            it.printf(0, 0, "PA:%0.0f W",id(power_channel_a).state);
+            it.printf(0, 1, "PB:%0.0f W",id(power_channel_b).state);
+            it.printf(0, 2, "PC:%0.0f W",id(power_channel_c).state);
+            it.printf(0, 3, "PD:%0.0f W",id(power_channel_d).state);
+            it.printf(9, 0, "EA:%0.3fkWh",id(energy_channel_a).state);
+            it.printf(9, 1, "EB:%0.3fkWh",id(energy_channel_b).state );
+            it.printf(9, 2, "EC:%0.3fkWh",id(energy_channel_c).state );
+            it.printf(9, 3, "ED:%0.3fkWh",id(energy_channel_d).state);
+              break;
+          }    
+
+
+switch :  
+  - platform: template
+    name: "Mode Auto"    
+    id: modeauto
+    optimistic: true
+    restore_mode: always_on   
+
+script:
+# on initialise a old_hc et old_hp le soir a minuit afin de simuler in semblant de utility sensor,
+  - id: reset_hphc
+    mode : single
+    then : 
+      - sensor.template.publish:
+          id: old_hc
+          state: !lambda |-
+            return id(thc).state;
+
+      - sensor.template.publish:    
+          id: old_hp
+          state: !lambda |-
+            return id(thp).state;
+
+# validation temperature  
+  - id: validation_temperature
+    mode: single
+    then:
+# Si Temp triac inferieure a tmax - 2 °c alors ok
+      - if:
+          condition:
+            lambda: 'return id(temperature_triac).state < (id(tmax).state-2);'
+
+          then:
+            - binary_sensor.template.publish:
+                id: temperature_triac_ok
+                state: ON
+            - logger.log:
+                format: "Log temperature triac ok"
+                level: "info"  
+            - output.turn_off: led_red
+
+# Si Temp Triac supérieur ou égale a tmax alors NOK
+      - if: 
+          condition:
+            lambda: 'return id(temperature_triac).state >= id(tmax).state;'
+          then:
+            - binary_sensor.template.publish:
+                id: temperature_triac_ok
+                state: OFF
+    
+            - logger.log:
+                format: "Log temperature triac nok"
+                level: "info"
+            - output.turn_on: led_red
+# Si Temp Triac invalide
+      - if: 
+          condition:
+            lambda: 'return (isnan(id(temperature_triac).state));' 
+          then:
+            - binary_sensor.template.publish:
+                id: temperature_triac_ok
+                state: OFF
+
+            - logger.log:
+                format: "Log Temperature triac invalide"
+                level: "info" 
+            - output.turn_on: led_red 
+
+# test nuit
+  - id: test_nuit
+    mode: single
+    then:
+      - if:
+          condition:
+            sun.is_below_horizon
+          then:
+            - binary_sensor.template.publish:
+                id: mode_nuit
+                state: ON
+            - logger.log:
+                format: "Passage Mode Nuit"
+                level: "info"
+      - if:
+          condition:
+            sun.is_above_horizon
+          then:
+            - binary_sensor.template.publish:
+                id: mode_nuit
+                state: OFF
+            - logger.log:
+                format: "Passage Mode Jour"
+                level: "info"
+
+
+# test heure creuse
+  - id: test_heure_creuse
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ptec).state == "HC..";'
+          then:
+            - binary_sensor.template.publish:
+                id: mode_hp
+                state: OFF
+            - logger.log:
+                format: "Passage Heure Creuse"
+                level: "info"
+      - if:
+          condition:
+            lambda: 'return id(ptec).state == "HP..";'
+          then:
+            - binary_sensor.template.publish:
+                id: mode_hp
+                state: ON
+            - logger.log:
+                format: "Passage Heure Pleine"
+                level: "info"
+
+
+# calcul de la valeur d'injection
+  - id: calcul_injection
+    mode: single
+    then:
+# mode jour routage si mode auto activé
+      - if:
+          condition:
+            and:
+              - binary_sensor.is_on : temperature_triac_ok
+              - binary_sensor.is_off : mode_nuit
+              - switch.is_on : modeauto
+          then:
+            - lambda: |-
+                id(increment) = (id(puissance_reseau).state*id(coeff_r).state)/1000*-1;
+            - lambda: |-
+                id(sortie_triac) = id(sortie_triac)+id(increment);
+                  if (!isnan(id(sortie_triac))) {
+                    id(sortie_triac) = id(sortie_triac)+id(increment);
+                  }else{
+                    id(sortie_triac)=0;
+                  }
+                  if (id(sortie_triac) <= 0){
+                    id(sortie_triac) = 0;
+                  } else if(id(sortie_triac)>=id(pmax).state){
+                    id(sortie_triac) = id(pmax).state;
+                  }
+            - light.turn_on:
+                id: gradateur
+                brightness: !lambda |-
+                  return id(sortie_triac)/100 ;
+            - output.turn_on: led_green
+            - logger.log:
+                format: "Log Auto OK sortie Triac %f - Increment %f"
+                args: [ 'id(sortie_triac)', 'id(increment)' ]
+                level: info
+            - lambda: |-
+                id(affichage_sortie_triac).publish_state( id(sortie_triac) );
+                id(affichage_increment).publish_state( id(increment) );
+
+# mode nuit heure pleine on desactive le gradateur
+      - if: 
+          condition:
+            and:
+              - binary_sensor.is_on: mode_nuit
+              - binary_sensor.is_on : mode_hp
+          then:
+            - lambda: |-
+                id(sortie_triac) = 0;
+                id(increment) = 0;
+
+            - output.turn_off: led_green
+            - logger.log:
+                format: "Log mode nuit heure pleine"
+                level: info
+# mode nuit heure creuse on active le gradateur
+      - if:
+          condition:
+             and:
+              - binary_sensor.is_on: mode_nuit
+              - binary_sensor.is_off : mode_hp
+              - switch.is_on : modeauto
+          then:
+            - lambda: |-
+                id(sortie_triac) = id(pmax).state;
+                id(increment) = 0;
+            - light.turn_on:
+                id: gradateur
+                brightness: !lambda |-
+                  return id(sortie_triac)/100 ;
+            - output.turn_on: led_green
+            - logger.log:
+                format: "Log mode nuit heure creuse sortie triac %f"
+                args: [ 'id(sortie_triac)']
+                level: info
+# il y a un probleme on desactive le gradateur
+      - if: 
+          condition:
+            or:
+               - binary_sensor.is_off : temperature_triac_ok
+               - switch.is_off: modeauto
+          then:
+            - lambda: |-
+                id(sortie_triac) = 0;
+                id(increment) = 0;
+ 
+            - output.turn_off: led_green
+            - logger.log:
+                format: "Log mode manuel ou surchauffe"
+                level: info
+      - lambda: |-
+          id(affichage_sortie_triac).publish_state( id(sortie_triac) );
+          id(affichage_increment).publish_state( id(increment) );
+
+
+interval:
+
+  - interval: 5s
+    then:
+      - script.execute: test_nuit
+      - script.execute: test_heure_creuse
+
+      - lambda: |-
+          id(page) = (id(page) + 1);
+          if (id(page) > 5) {
+            id(page) = 1;
+          }
+  - interval: 1s
+    then:          
+      - script.execute: validation_temperature      
+      - script.execute: calcul_injection
